@@ -208,9 +208,24 @@ class OSMNavigator(Node):
             if turn > 25: instruction = "TURN RIGHT"
             elif turn < -25: instruction = "TURN LEFT"
 
-        # 3. Print Output
+        # 3. Publish Downstream Command via MQTT
         sign = "+" if angle_display >= 0 else ""
+        
+        # Terminal visual output for debugging
         print(f">> {instruction:<12} {sign}{angle_display:.1f}°  |  Speed: {self.current_speed:.2f} m/s  [{source_name}]")
+        
+        # Build the structured command for the robot
+        command_payload = {
+            "type": "command",
+            "action": instruction,
+            "angle": float(round(angle_display, 2)),
+            "speed": float(round(self.current_speed, 2)),
+            "source": source_name
+        }
+        
+        # Publish it back down to the edge device (Raspberry Pi)
+        command_topic = "autonomous/001/commands"
+        self.mqtt_client.publish(command_topic, json.dumps(command_payload))
 
     def destroy_node(self):
         # Gracefully shut down the MQTT background thread
