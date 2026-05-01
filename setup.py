@@ -30,6 +30,7 @@ setup(
         'console_scripts': [
             'osm_planner = osm_navigator.osm_planner:main',
             'synthetic_gps = osm_navigator.synthetic_gps:main',
+            'imu_bridge = osm_navigator.imu_bridge:main',
         ],
     },
 )
