@@ -2,8 +2,7 @@
 import rclpy
 from rclpy.node import Node
 import serial
-import re
-import math
+import json
 from sensor_msgs.msg import Imu
 
 class IMUBridge(Node):
@@ -11,16 +10,16 @@ class IMUBridge(Node):
         super().__init__('imu_bridge')
         
         # --- CONFIGURATION ---
-        self.serial_port = '/dev/ttyUSB0'  # Change to /dev/ttyACM0 if needed
-        self.baud_rate = 115200            # Ensure this matches your microcontroller's baud rate
+        self.serial_port = '/dev/ttyUSB0'  # Adjust if your Pi uses ttyUSB1 or ttyACM0
+        self.baud_rate = 115200            
         
         self.imu_pub = self.create_publisher(Imu, '/imu/data', 10)
         
-        # State variables to hold data until a full block is received
+        # Pre-allocate message to save processing power
         self.current_msg = Imu()
         self.current_msg.header.frame_id = "base_link"
         
-        # Fake covariance (Trusting the sensor decently well)
+        # Covariance matrix (Adjust these later if the EKF acts jittery)
         cov = [0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01]
         self.current_msg.orientation_covariance = cov
         self.current_msg.angular_velocity_covariance = cov
@@ -29,47 +28,49 @@ class IMUBridge(Node):
         try:
             self.ser = serial.Serial(self.serial_port, self.baud_rate, timeout=1)
             self.get_logger().info(f"Connected to IMU on {self.serial_port}")
-            # Use a fast timer to constantly read the serial buffer
+            # Run very fast to keep up with the serial stream
             self.create_timer(0.01, self.read_serial)
         except Exception as e:
             self.get_logger().error(f"Failed to connect to Serial Port: {e}")
 
     def read_serial(self):
-        if not self.ser.is_open:
+        # Ensure the serial connection actually exists before reading
+        if getattr(self, 'ser', None) is None or not self.ser.is_open:
             return
             
         while self.ser.in_waiting > 0:
             try:
+                # Read the line and clean up whitespace
                 line = self.ser.readline().decode('utf-8', errors='ignore').strip()
                 
-                # Extract all numbers from the line (handles typos like -0-02 or attached commas)
-                nums = [float(x) for x in re.findall(r'[-+]?\d*\.\d+|[-+]?\d+', line.replace('-0-02', '-0.02'))]
-
-                if "Angular velocity" in line and len(nums) >= 3:
-                    # Convert DPS to Rad/s
-                    self.current_msg.angular_velocity.x = nums[0] * (math.pi / 180.0)
-                    self.current_msg.angular_velocity.y = nums[1] * (math.pi / 180.0)
-                    self.current_msg.angular_velocity.z = nums[2] * (math.pi / 180.0)
+                # Check if it contains JSON payload (ignoring the "10:28:46 -> " timestamp)
+                if "{" in line and "}" in line:
+                    # Extract just the JSON string
+                    json_str = line[line.find("{") : line.rfind("}") + 1]
+                    data = json.loads(json_str)
                     
-                elif "Linear Acc" in line and len(nums) >= 3:
-                    # Convert G's to m/s^2
-                    self.current_msg.linear_acceleration.x = nums[0] * 9.80665
-                    self.current_msg.linear_acceleration.y = nums[1] * 9.80665
-                    self.current_msg.linear_acceleration.z = nums[2] * 9.80665
+                    # --- MAP JSON DIRECTLY TO ROS 2 MESSAGE ---
+                    self.current_msg.angular_velocity.x = float(data.get('gx', 0.0))
+                    self.current_msg.angular_velocity.y = float(data.get('gy', 0.0))
+                    self.current_msg.angular_velocity.z = float(data.get('gz', 0.0))
                     
-                elif "Quaternion" in line and len(nums) >= 4:
-                    # Quaternions need no math conversion, just mapping
-                    self.current_msg.orientation.x = nums[0]
-                    self.current_msg.orientation.y = nums[1]
-                    self.current_msg.orientation.z = nums[2]
-                    self.current_msg.orientation.w = nums[3]
+                    self.current_msg.linear_acceleration.x = float(data.get('ax', 0.0))
+                    self.current_msg.linear_acceleration.y = float(data.get('ay', 0.0))
+                    self.current_msg.linear_acceleration.z = float(data.get('az', 0.0))
                     
-                    # Quaternion is usually the last line in the block, so we publish now!
+                    self.current_msg.orientation.x = float(data.get('qx', 0.0))
+                    self.current_msg.orientation.y = float(data.get('qy', 0.0))
+                    self.current_msg.orientation.z = float(data.get('qz', 0.0))
+                    self.current_msg.orientation.w = float(data.get('qw', 1.0))
+                    
+                    # Stamp it with the Raspberry Pi's exact system time and publish!
                     self.current_msg.header.stamp = self.get_clock().now().to_msg()
                     self.imu_pub.publish(self.current_msg)
                     
+            except json.JSONDecodeError:
+                pass # Ignore lines that are half-written or corrupted during serial transmission
             except Exception as e:
-                pass # Ignore garbled serial lines during startup
+                pass # Ignore other random serial noise
 
 def main(args=None):
     rclpy.init(args=args)
