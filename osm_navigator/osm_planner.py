@@ -20,11 +20,14 @@ class OSMNavigator(Node):
         self.base_url = "http://router.project-osrm.org/route/v1/foot/"
         
         # --- MQTT CONFIGURATION ---
-        self.mqtt_broker = "172.16.21.221"  # <--- CHANGE THIS TO YOUR MQTT BROKER IP
+        self.mqtt_broker = "172.16.21.221"
         self.mqtt_port = 1883
-        self.mqtt_topic = "autonomous/001/cmd/maplocation"
         self.mqtt_username = "raghulrajg"
         self.mqtt_password = "Gr2_nemam"
+        
+        # SYNCED WITH MOSQUITTO COMMANDS & RASPBERRY PI
+        self.mqtt_topic = "autonomous/robot/2/goal"
+        self.command_topic = "autonomous/robot/2/commands"
         
         # --- STATE ---
         self.current_speed = 0.0
@@ -51,47 +54,44 @@ class OSMNavigator(Node):
         self.mqtt_client.on_connect = self.on_mqtt_connect
         self.mqtt_client.on_message = self.on_mqtt_message
         
-        # ADD THIS LINE HERE (Must be before connect!):
+        # Authentication must be set before connecting
         self.mqtt_client.username_pw_set(self.mqtt_username, self.mqtt_password)
         
         try:
             self.mqtt_client.connect(self.mqtt_broker, self.mqtt_port, 60)
             self.mqtt_client.loop_start() 
-            self.get_logger().info("--- NAVIGATOR READY (FAILSAFE + SECURE MQTT MODE) ---")
+            self.get_logger().info("--- NAVIGATOR READY (DISTRIBUTED EDGE ARCHITECTURE) ---")
         except Exception as e:
             self.get_logger().error(f"Failed to connect to MQTT Broker: {e}")
 
     # --- MQTT CALLBACKS ---
     def on_mqtt_connect(self, client, userdata, flags, rc):
         if rc == 0:
-            self.get_logger().info(f"Connected to MQTT! Subscribing to: {self.mqtt_topic}")
+            self.get_logger().info(f"Connected to MQTT Broker. Subscribed to: {self.mqtt_topic}")
             client.subscribe(self.mqtt_topic)
         else:
             self.get_logger().error(f"MQTT connection failed with code {rc}")
 
     def on_mqtt_message(self, client, userdata, msg):
         try:
-            # Decode the payload and parse the JSON
             payload = msg.payload.decode('utf-8')
             data = json.loads(payload)
-            print(f"Received MQTT message: {data}")
             target_lat = data.get('lat')
             target_lng = data.get('lng')
             
             if target_lat is not None and target_lng is not None:
-                self.get_logger().info(f"Goal received via MQTT: Lat={target_lat}, Lng={target_lng}")
+                self.get_logger().info(f"Target Acquired via MQTT: Lat={target_lat}, Lng={target_lng}")
                 self.handle_new_goal(target_lat, target_lng)
             else:
-                self.get_logger().warn(f"MQTT JSON missing 'lat' or 'lng': {payload}")
+                self.get_logger().warn(f"Malformed payload received (missing coordinates): {payload}")
                 
         except json.JSONDecodeError:
-            self.get_logger().error(f"Invalid JSON received on MQTT: {msg.payload}")
+            self.get_logger().error(f"Data Decode Error: {msg.payload}")
         except Exception as e:
-            self.get_logger().error(f"Error processing MQTT message: {e}")
+            self.get_logger().error(f"Processing Error: {e}")
 
     # --- SENSOR CALLBACKS ---
     def odom_callback(self, msg):
-        # EKF is working! Use its data.
         vx = msg.twist.twist.linear.x
         vy = msg.twist.twist.linear.y
         vz = msg.twist.twist.linear.z
@@ -100,26 +100,22 @@ class OSMNavigator(Node):
 
     def gps_callback(self, msg):
         self.raw_gps = (msg.latitude, msg.longitude)
-        
-        # If we have a path datum, we can calculate local position from Raw GPS
         if self.base_utm:
             e, n, _, _ = utm.from_latlon(msg.latitude, msg.longitude)
             self.last_known_gps = (e - self.base_utm[0], n - self.base_utm[1])
 
     def ros_goal_callback(self, msg):
-        # Fallback to allow sending goals via terminal if needed
-        self.get_logger().info("Goal received via ROS Topic.")
+        self.get_logger().info("Target Acquired via Local ROS Topic.")
         self.handle_new_goal(msg.latitude, msg.longitude)
 
     # --- NAVIGATION LOGIC ---
     def handle_new_goal(self, target_lat, target_lng):
-        """ Shared logic for both MQTT and ROS goals """
         if self.raw_gps is None:
-            self.get_logger().warn("Waiting for initial GPS fix before routing...")
+            self.get_logger().warn("Awaiting initial telemetry fix before calculating trajectory.")
             return
         
         target_gps = (target_lat, target_lng)
-        self.get_logger().info("Fetching new route...")
+        self.get_logger().info("Calculating OSRM trajectory...")
         self.fetch_route(self.raw_gps, target_gps)
 
     def fetch_route(self, start, end):
@@ -130,9 +126,9 @@ class OSMNavigator(Node):
                 coords = resp.json()['routes'][0]['geometry']['coordinates']
                 self.process_path(coords)
             else:
-                self.get_logger().error(f"OSRM Error: {resp.status_code}")
+                self.get_logger().error(f"Routing Engine Error: {resp.status_code}")
         except Exception as e:
-            self.get_logger().error(f"Network Error: {e}")
+            self.get_logger().error(f"Network Fault: {e}")
 
     def process_path(self, coords_list):
         if not coords_list: return
@@ -142,7 +138,6 @@ class OSMNavigator(Node):
         path_msg = Path()
         path_msg.header.frame_id = "map"
 
-        # Set the Datum (0,0 point) based on the path start
         self.base_utm = utm.from_latlon(coords_list[0][1], coords_list[0][0])[0:2]
 
         for lon, lat in coords_list:
@@ -158,37 +153,42 @@ class OSMNavigator(Node):
             path_msg.poses.append(pose)
 
         self.path_pub.publish(path_msg)
+        self.get_logger().info("Trajectory calculated and published successfully.")
         
     def navigation_loop(self):
         if not self.path_points:
             return
 
-        # --- FAILSAFE LOGIC ---
+        # --- TELEMETRY EVALUATION ---
         active_pose = self.current_pose
         source_name = "EKF"
         
         if active_pose is None:
             if self.last_known_gps is not None:
                 active_pose = self.last_known_gps
-                source_name = "GPS (Backup)"
+                source_name = "GPS_BACKUP"
             else:
-                print(">> WAITING FOR SENSORS...")
+                # Silently return to keep terminal clean during initialization
                 return
 
-        # 1. Navigation Logic
+        # 1. Waypoint Evaluation
         target_x, target_y = self.path_points[self.current_idx]
         curr_x, curr_y = active_pose
         
         dist = math.sqrt((target_x - curr_x)**2 + (target_y - curr_y)**2)
 
-        if dist < 3.0: # Waypoint reached radius
+        if dist < 3.0: 
             if self.current_idx < len(self.path_points) - 1:
                 self.current_idx += 1
             else:
-                print(f">> DESTINATION REACHED | Source: {source_name}")
+                # Stop the robot when destination is reached
+                stop_payload = {"type": "command", "action": "STOP", "angle": 0.0, "speed": 0.0, "source": source_name}
+                self.mqtt_client.publish(self.command_topic, json.dumps(stop_payload))
+                print(f"[NAV] Destination achieved via {source_name}. Halting execution.")
+                self.path_points = [] # Clear path
                 return
 
-        # 2. Heading Calculation
+        # 2. Kinematic Calculation
         dx = target_x - curr_x
         dy = target_y - curr_y
         desired_heading = math.degrees(math.atan2(dy, dx))
@@ -205,16 +205,14 @@ class OSMNavigator(Node):
             while turn > 180: turn -= 360
             angle_display = turn
 
-            if turn > 25: instruction = "TURN RIGHT"
-            elif turn < -25: instruction = "TURN LEFT"
+            if turn > 25: instruction = "TURN_RIGHT"
+            elif turn < -25: instruction = "TURN_LEFT"
 
-        # 3. Publish Downstream Command via MQTT
+        # 3. Network Dispatch
         sign = "+" if angle_display >= 0 else ""
         
-        # Terminal visual output for debugging
-        print(f">> {instruction:<12} {sign}{angle_display:.1f}°  |  Speed: {self.current_speed:.2f} m/s  [{source_name}]")
+        print(f"[EXEC] Action: {instruction:<12} | Vector: {sign}{angle_display:.1f}° | Velocity: {self.current_speed:.2f} m/s | Lock: {source_name}")
         
-        # Build the structured command for the robot
         command_payload = {
             "type": "command",
             "action": instruction,
@@ -223,12 +221,9 @@ class OSMNavigator(Node):
             "source": source_name
         }
         
-        # Publish it back down to the edge device (Raspberry Pi)
-        command_topic = "autonomous/001/commands"
-        self.mqtt_client.publish(command_topic, json.dumps(command_payload))
+        self.mqtt_client.publish(self.command_topic, json.dumps(command_payload))
 
     def destroy_node(self):
-        # Gracefully shut down the MQTT background thread
         self.mqtt_client.loop_stop()
         self.mqtt_client.disconnect()
         super().destroy_node()

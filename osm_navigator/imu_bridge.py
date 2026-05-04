@@ -10,17 +10,18 @@ class CloudTelemetryBridge(Node):
         super().__init__('telemetry_bridge')
         
         # --- MQTT CONFIGURATION ---
-        self.mqtt_broker = "127.0.0.1"  # IP of your MQTT Broker
-        self.mqtt_port = 1883           # <--- THIS IS THE ONLY PORT WE NEED NOW!
-        self.mqtt_user = "my_robot_user"
-        self.mqtt_pass = "my_secure_password"
-        self.telemetry_topic = "autonomous/001/telemetry"
+        self.mqtt_broker = "172.16.21.221"
+        self.mqtt_port = 1883
+        self.mqtt_user = "raghulrajg"
+        self.mqtt_pass = "Gr2_nemam"
+        
+        # SYNCED WITH RASPBERRY PI:
+        self.telemetry_topic = "autonomous/robot/2/telemetry"
         
         # --- ROS 2 PUBLISHERS ---
         self.imu_pub = self.create_publisher(Imu, '/imu/data', 10)
         self.gps_pub = self.create_publisher(NavSatFix, '/gps/fix', 10)
         
-        # Pre-allocate IMU message structure
         self.imu_msg = Imu()
         self.imu_msg.header.frame_id = "base_link"
         cov = [0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01]
@@ -28,11 +29,10 @@ class CloudTelemetryBridge(Node):
         self.imu_msg.angular_velocity_covariance = cov
         self.imu_msg.linear_acceleration_covariance = cov
 
-        # Pre-allocate GPS message structure
         self.gps_msg = NavSatFix()
         self.gps_msg.header.frame_id = "gps_link"
         self.gps_msg.position_covariance = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0]
-        self.gps_msg.position_covariance_type = 2 # COVARIANCE_TYPE_DIAGONAL_KNOWN
+        self.gps_msg.position_covariance_type = 2
 
         # --- START MQTT CLIENT ---
         self.mqtt_client = mqtt.Client()
@@ -56,41 +56,35 @@ class CloudTelemetryBridge(Node):
         try:
             payload = msg.payload.decode('utf-8')
             data = json.loads(payload)
+            current_time = self.get_clock().now().to_msg()
             
-            if data.get("type") == "telemetry":
-                current_time = self.get_clock().now().to_msg()
+            # --- 1. IMU PARSING ---
+            if "ax" in data and "gx" in data:
+                self.imu_msg.header.stamp = current_time
+                self.imu_msg.linear_acceleration.x = float(data.get('ax', 0.0))
+                self.imu_msg.linear_acceleration.y = float(data.get('ay', 0.0))
+                self.imu_msg.linear_acceleration.z = float(data.get('az', 0.0))
                 
-                # 1. Parse and Publish IMU Data
-                if "imu" in data:
-                    imu_data = data["imu"]
-                    self.imu_msg.header.stamp = current_time
-                    
-                    self.imu_msg.linear_acceleration.x = float(imu_data.get('ax', 0.0))
-                    self.imu_msg.linear_acceleration.y = float(imu_data.get('ay', 0.0))
-                    self.imu_msg.linear_acceleration.z = float(imu_data.get('az', 0.0))
-                    
-                    self.imu_msg.angular_velocity.x = float(imu_data.get('gx', 0.0))
-                    self.imu_msg.angular_velocity.y = float(imu_data.get('gy', 0.0))
-                    self.imu_msg.angular_velocity.z = float(imu_data.get('gz', 0.0))
-                    
-                    self.imu_msg.orientation.x = float(imu_data.get('qx', 0.0))
-                    self.imu_msg.orientation.y = float(imu_data.get('qy', 0.0))
-                    self.imu_msg.orientation.z = float(imu_data.get('qz', 0.0))
-                    self.imu_msg.orientation.w = float(imu_data.get('qw', 1.0))
-                    
-                    self.imu_pub.publish(self.imu_msg)
+                self.imu_msg.angular_velocity.x = float(data.get('gx', 0.0))
+                self.imu_msg.angular_velocity.y = float(data.get('gy', 0.0))
+                self.imu_msg.angular_velocity.z = float(data.get('gz', 0.0))
+                
+                self.imu_msg.orientation.x = float(data.get('qx', 0.0))
+                self.imu_msg.orientation.y = float(data.get('qy', 0.0))
+                self.imu_msg.orientation.z = float(data.get('qz', 0.0))
+                self.imu_msg.orientation.w = float(data.get('qw', 1.0))
+                
+                self.imu_pub.publish(self.imu_msg)
 
-                # 2. Parse and Publish GPS Data
-                if "gps" in data:
-                    gps_data = data["gps"]
-                    self.gps_msg.header.stamp = current_time
-                    self.gps_msg.latitude = float(gps_data.get('lat', 0.0))
-                    self.gps_msg.longitude = float(gps_data.get('lon', 0.0))
-                    
-                    self.gps_pub.publish(self.gps_msg)
+            # --- 2. GPS PARSING ---
+            if "lat" in data and "lon" in data:
+                self.gps_msg.header.stamp = current_time
+                self.gps_msg.latitude = float(data.get('lat', 0.0))
+                self.gps_msg.longitude = float(data.get('lon', 0.0))
+                self.gps_pub.publish(self.gps_msg)
 
         except json.JSONDecodeError:
-            pass # Ignore broken network packets
+            pass
 
 def main(args=None):
     rclpy.init(args=args)
